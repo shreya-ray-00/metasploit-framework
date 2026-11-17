@@ -16,11 +16,6 @@ class MetasploitModule < Msf::Auxiliary
   include Msf::OptionalSession::SMB
 
   # MS-EVEN (EventLog Remoting Protocol) endpoint for DCERPC bind
-  module Even
-    UUID = '82273fdc-e32a-18c3-3f78-827929dc23ea'
-    VER_MAJOR = 0
-    VER_MINOR = 0
-  end
 
   def initialize(info = {})
     super(
@@ -101,7 +96,7 @@ class MetasploitModule < Msf::Auxiliary
 
       vprint_status('Binding to MS-EVEN interface...')
       @pipe.bind(
-        endpoint: Even,
+        endpoint: RubySMB::Dcerpc::Even,
         auth_level: RubySMB::Dcerpc::RPC_C_AUTHN_LEVEL_PKT_INTEGRITY,
         auth_type: RubySMB::Dcerpc::RPC_C_AUTHN_WINNT
       )
@@ -183,13 +178,9 @@ class MetasploitModule < Msf::Auxiliary
 
   # Query a path via ElfrOpenBELW and return the resolved NTStatus, or nil on error.
   def query_path_status(path)
-    raw_response = even_call(path)
-    if raw_response.nil? || raw_response.length < 4
-      print_error("#{path} - Unexpected response")
-      return nil
-    end
+    response = @pipe.elfr_open_(path)
 
-    status_code = raw_response[-4, 4].unpack1('V')
+    status_code = response.error_status
     status = ::WindowsError::NTStatus.find_by_retval(status_code).first
     if status.nil?
       vprint_status("#{path} - Unknown NTSTATUS 0x#{status_code.to_s(16).rjust(8, '0')} (#{status_code})")
@@ -218,64 +209,7 @@ class MetasploitModule < Msf::Auxiliary
     end
   end
 
-  # Send ElfrOpenBELW (Opnum 9) to check file existence.
-  # Uses manual stub assignment because RubySMB's dcerpc_request
-  # silently discards stub data for non-registered endpoints.
-  # https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-even/4db1601c-7bc2-4d5c-8375-c58a6f11c9d8
-  def even_call(path)
-    stub = build_elfr_open_belw_stub(path)
-    request = RubySMB::Dcerpc::Request.new({ opnum: 9 })
-    request.stub.assign(stub)
-
-    @pipe.set_integrity_privacy(
-      request,
-      auth_level: RubySMB::Dcerpc::RPC_C_AUTHN_LEVEL_PKT_INTEGRITY,
-      auth_type: RubySMB::Dcerpc::RPC_C_AUTHN_WINNT
-    )
-
-    @pipe.ioctl_send_recv(
-      request,
-      auth_level: RubySMB::Dcerpc::RPC_C_AUTHN_LEVEL_PKT_INTEGRITY,
-      auth_type: RubySMB::Dcerpc::RPC_C_AUTHN_WINNT
-    )
-  end
-
-  # Build NDR-encoded stub for ElfrOpenBELW.
-  #
-  # Wire format (MS-EVEN 3.1.4.12):
-  #   [in] EVENTLOG_HANDLE_W UNCServerName  - NULL pointer
-  #   [in] RPC_UNICODE_STRING BackupFileName - the path to check
-  #   [in] unsigned long MajorVersion        - 1
-  #   [in] unsigned long MinorVersion        - 1
-  def build_elfr_open_belw_stub(path)
-    stub = ''.b
-
-    # UNCServerName: NULL pointer
-    stub << [0].pack('V')
-
-    # BackupFileName: RPC_UNICODE_STRING (MS-DTYP 2.3.10)
-    # MaximumLength must be Length + 1 to satisfy the EventLog service's
-    # internal validation.
-    unicode_path = path.encode('UTF-16LE').b
-    byte_length = unicode_path.length
-    char_count = byte_length / 2
-
-    stub << [byte_length, byte_length + 1].pack('vv') # Length, MaximumLength
-    stub << [0x00020000].pack('V') # Buffer referent ID
-
-    # Conformant varying array: MaxCount, Offset, ActualCount, data
-    stub << [char_count, 0, char_count].pack('VVV')
-    stub << unicode_path
-
-    # Pad to 4-byte alignment
-    pad = (4 - (stub.length % 4)) % 4
-    stub << "\x00".b * pad
-
-    # MajorVersion, MinorVersion
-    stub << [1, 1].pack('VV')
-
-    stub
-  end
+  
 
   def report_file_status(file_path, nt_status)
     case nt_status
